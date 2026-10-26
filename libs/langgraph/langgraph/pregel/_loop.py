@@ -938,16 +938,50 @@ class PregelLoop:
         #   - Same run_id: re-entry into an ongoing run (e.g. stream reconnect)
         configurable = self.config.get(CONF, {})
         input_is_command = isinstance(self.input, Command)
+        # The outer graph propagates its resuming flag to every subgraph
+        # call, but the flag describes the parent's run, not this one's.
+        # A subgraph whose previous run already finished and that receives
+        # fresh input is being invoked again, not resumed: treating it as
+        # a resume would replay the finished checkpoint and silently drop
+        # the new input. The previous run counts as finished only when it
+        # left nothing behind — no unconsumed writes (pending interrupts,
+        # task outputs or errors) and no task still waiting to run (a run
+        # paused at a static breakpoint inside the subgraph).
+        resuming_flag = configurable.get(CONFIG_KEY_RESUMING)
+        if (
+            self.is_nested
+            and resuming_flag
+            and self.input is not None
+            and not input_is_command
+            and not self.checkpoint_pending_writes
+            and not prepare_next_tasks(
+                self.checkpoint,
+                self.checkpoint_pending_writes,
+                self.nodes,
+                self.channels,
+                self.managed,
+                self.config,
+                self.step,
+                self.stop,
+                for_execution=True,
+                store=None,
+                checkpointer=None,
+                manager=None,
+                updated_channels=None,
+            )
+        ):
+            resuming_flag = False
         is_resuming = bool(self.checkpoint["channel_versions"]) and bool(
-            configurable.get(
-                CONFIG_KEY_RESUMING,
+            resuming_flag
+            if resuming_flag is not None
+            else (
                 self.input is None
                 or input_is_command
                 or (
                     not self.is_nested
                     and self.config.get("metadata", {}).get("run_id")
                     == self.checkpoint_metadata.get("run_id", MISSING)
-                ),
+                )
             )
         )
 
@@ -971,7 +1005,7 @@ class PregelLoop:
                 (input_is_command and cast(Command, self.input).resume is not None)
                 # Subgraphs: resume arrives via config flag from parent
                 # (subgraph input is a Send arg, not a Command)
-                or configurable.get(CONFIG_KEY_RESUMING, False)
+                or bool(resuming_flag)
             )
         )
         # Finished tasks rerun only on time travel, or on a resume at a
